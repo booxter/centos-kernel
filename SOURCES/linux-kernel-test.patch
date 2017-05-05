@@ -1,0 +1,635 @@
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index c0bfd53..18bac33 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -548,6 +548,7 @@ static inline u32 skb_mstamp_us_delta(const struct skb_mstamp *t1,
+  *	@wifi_acked: whether frame was acked on wifi or not
+  *	@no_fcs:  Request NIC to treat last 4 bytes as Ethernet FCS
+  *	@xmit_more: More SKBs are pending for this queue
++ *	@dst_pending_confirm: need to confirm neighbour
+  *	@napi_id: id of the NAPI struct this skb came from
+  *	@secmark: security marking
+  *	@mark: Generic packet mark
+@@ -711,6 +712,7 @@ struct sk_buff {
+ 	RH_KABI_EXTEND(__u8	csum_level:2)
+ 	RH_KABI_EXTEND(__u8	rh_csum_pad:1)
+ 	RH_KABI_EXTEND(__u8	csum_bad:1)
++	RH_KABI_EXTEND(__u8	dst_pending_confirm:1)
+ 	/* 12 bit hole */
+ 	RH_KABI_EXTEND(kmemcheck_bitfield_end(flags3))
+ 
+@@ -3358,6 +3360,16 @@ static inline bool skb_rx_queue_recorded(const struct sk_buff *skb)
+ 	return skb->queue_mapping != 0;
+ }
+ 
++static inline void skb_set_dst_pending_confirm(struct sk_buff *skb, u32 val)
++{
++	skb->dst_pending_confirm = val;
++}
++
++static inline bool skb_get_dst_pending_confirm(const struct sk_buff *skb)
++{
++	return skb->dst_pending_confirm != 0;
++}
++
+ u16 __skb_tx_hash(const struct net_device *dev, struct sk_buff *skb,
+ 		  unsigned int num_tx_queues);
+ 
+diff --git a/include/net/arp.h b/include/net/arp.h
+index 7509d9d..4b2bb21 100644
+--- a/include/net/arp.h
++++ b/include/net/arp.h
+@@ -46,6 +46,22 @@ static inline struct neighbour *__ipv4_neigh_lookup(struct net_device *dev, u32
+ 	return n;
+ }
+ 
++static inline void __ipv4_confirm_neigh(struct net_device *dev, u32 key)
++{
++	struct neighbour *n;
++
++	rcu_read_lock_bh();
++	n = __ipv4_neigh_lookup_noref(dev, key);
++	if (n) {
++		unsigned long now = jiffies;
++
++		/* avoid dirtying neighbour */
++		if (n->confirmed != now)
++			n->confirmed = now;
++	}
++	rcu_read_unlock_bh();
++}
++
+ void arp_init(void);
+ int arp_find(unsigned char *haddr, struct sk_buff *skb);
+ int arp_ioctl(struct net *net, unsigned int cmd, void __user *arg);
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 43e4374..3ffcd26 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -496,6 +496,13 @@ static inline struct neighbour *dst_neigh_lookup_skb(const struct dst_entry *dst
+ 	return IS_ERR(n) ? NULL : n;
+ }
+ 
++static inline void dst_confirm_neigh(const struct dst_entry *dst,
++				     const void *daddr)
++{
++	if (dst->ops->confirm_neigh)
++		dst->ops->confirm_neigh(dst, daddr);
++}
++
+ static inline void dst_link_failure(struct sk_buff *skb)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+diff --git a/include/net/dst_ops.h b/include/net/dst_ops.h
+index 1f99a1d..14ca53c 100644
+--- a/include/net/dst_ops.h
++++ b/include/net/dst_ops.h
+@@ -33,6 +33,8 @@ struct dst_ops {
+ 	struct neighbour *	(*neigh_lookup)(const struct dst_entry *dst,
+ 						struct sk_buff *skb,
+ 						const void *daddr);
++	void			(*confirm_neigh)(const struct dst_entry *dst,
++						 const void *daddr);
+ 
+ 	struct kmem_cache	*kmem_cachep;
+ 
+diff --git a/include/net/ndisc.h b/include/net/ndisc.h
+index 08ee8ac..23cbfc3 100644
+--- a/include/net/ndisc.h
++++ b/include/net/ndisc.h
+@@ -189,6 +189,23 @@ static inline struct neighbour *__ipv6_neigh_lookup(struct net_device *dev, cons
+ 	return n;
+ }
+ 
++static inline void __ipv6_confirm_neigh(struct net_device *dev,
++					const void *pkey)
++{
++	struct neighbour *n;
++
++	rcu_read_lock_bh();
++	n = __ipv6_neigh_lookup_noref(dev, pkey);
++	if (n) {
++		unsigned long now = jiffies;
++
++		/* avoid dirtying neighbour */
++		if (n->confirmed != now)
++			n->confirmed = now;
++	}
++	rcu_read_unlock_bh();
++}
++
+ extern int			ndisc_init(void);
+ extern int			ndisc_late_init(void);
+ 
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 58c7b9c..88071bf 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -231,6 +231,7 @@ struct cg_proto;
+   *	@sk_wq: sock wait queue and async head
+   *	@sk_rx_dst: receive input route used by early demux
+   *	@sk_dst_cache: destination cache
++  *	@sk_dst_pending_confirm: need to confirm neighbour
+   *	@sk_policy: flow policy
+   *	@sk_receive_queue: incoming packets
+   *	@sk_wmem_alloc: transmit queue bytes committed
+@@ -420,6 +421,7 @@ struct sock {
+ 	struct sk_buff		*sk_send_head;
+ 	__s32			sk_peek_off;
+ 	int			sk_write_pending;
++	__u32			sk_dst_pending_confirm;
+ #ifdef CONFIG_SECURITY
+ 	void			*sk_security;
+ #endif
+@@ -1840,6 +1842,7 @@ static inline void dst_negative_advice(struct sock *sk)
+ 		if (ndst != dst) {
+ 			rcu_assign_pointer(sk->sk_dst_cache, ndst);
+ 			sk_reset_txq(sk);
++			sk->sk_dst_pending_confirm = 0;
+ 		}
+ 	}
+ }
+@@ -1850,6 +1853,7 @@ __sk_dst_set(struct sock *sk, struct dst_entry *dst)
+ 	struct dst_entry *old_dst;
+ 
+ 	sk_tx_queue_clear(sk);
++	sk->sk_dst_pending_confirm = 0;
+ 	/*
+ 	 * This can be called while sk is owned by the caller only,
+ 	 * with no state that can be checked in a rcu_dereference_check() cond
+@@ -1865,6 +1869,7 @@ sk_dst_set(struct sock *sk, struct dst_entry *dst)
+ 	struct dst_entry *old_dst;
+ 
+ 	sk_tx_queue_clear(sk);
++	sk->sk_dst_pending_confirm = 0;
+ 	old_dst = xchg(&sk->sk_dst_cache, dst);
+ 	dst_release(old_dst);
+ }
+@@ -1885,6 +1890,26 @@ extern struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
+ 
+ extern struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+ 
++static inline void sk_dst_confirm(struct sock *sk)
++{
++	if (!sk->sk_dst_pending_confirm)
++		sk->sk_dst_pending_confirm = 1;
++}
++
++static inline void sock_confirm_neigh(struct sk_buff *skb, struct neighbour *n)
++{
++	if (skb_get_dst_pending_confirm(skb)) {
++		struct sock *sk = skb->sk;
++		unsigned long now = jiffies;
++
++		/* avoid dirtying neighbour */
++		if (n->confirmed != now)
++			n->confirmed = now;
++		if (sk && sk->sk_dst_pending_confirm)
++			sk->sk_dst_pending_confirm = 0;
++	}
++}
++
+ bool sk_mc_loop(struct sock *sk);
+ 
+ static inline bool sk_can_gso(const struct sock *sk)
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 960b698f..53cf90e 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -496,6 +496,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
+ 
+ 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+ 		sk_tx_queue_clear(sk);
++		sk->sk_dst_pending_confirm = 0;
+ 		RCU_INIT_POINTER(sk->sk_dst_cache, NULL);
+ 		dst_release(dst);
+ 		return NULL;
+@@ -1505,6 +1506,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
+ 				af_family_clock_key_strings[newsk->sk_family]);
+ 
+ 		newsk->sk_dst_cache	= NULL;
++		newsk->sk_dst_pending_confirm = 0;
+ 		newsk->sk_wmem_queued	= 0;
+ 		newsk->sk_forward_alloc = 0;
+ 		newsk->sk_send_head	= NULL;
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 7ade299..e0c1fe5 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -207,7 +207,10 @@ static inline int ip_finish_output2(struct sock *sk, struct sk_buff *skb)
+ 	if (unlikely(!neigh))
+ 		neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
+ 	if (!IS_ERR(neigh)) {
+-		int res = dst_neigh_output(dst, neigh, skb);
++		int res;
++
++		sock_confirm_neigh(skb, neigh);
++		res = dst_neigh_output(dst, neigh, skb);
+ 
+ 		rcu_read_unlock_bh();
+ 		return res;
+@@ -851,6 +854,8 @@ static inline int ip_ufo_append_data(struct sock *sk,
+ 
+ 		skb->csum = 0;
+ 
++		if (flags & MSG_CONFIRM)
++			skb_set_dst_pending_confirm(skb, 1);
+ 
+ 		__skb_queue_tail(queue, skb);
+ 	} else if (skb_is_gso(skb)) {
+@@ -1046,6 +1051,9 @@ alloc_new_skb:
+ 			exthdrlen = 0;
+ 			csummode = CHECKSUM_NONE;
+ 
++			if ((flags & MSG_CONFIRM) && !skb_prev)
++				skb_set_dst_pending_confirm(skb, 1);
++
+ 			/*
+ 			 * Put the packet on the pending queue.
+ 			 */
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 291ac78..2514660 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -626,7 +626,8 @@ out:
+ 	return err;
+ 
+ do_confirm:
+-	dst_confirm(&rt->dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(&rt->dst, &fl4.daddr);
+ 	if (!(msg->msg_flags & MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index ae470b0..83ed7e4 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -363,6 +363,9 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
+ 
+ 	skb->ip_summed = CHECKSUM_NONE;
+ 
++	if (flags & MSG_CONFIRM)
++		skb_set_dst_pending_confirm(skb, 1);
++
+ 	skb->transport_header = skb->network_header;
+ 	err = -EFAULT;
+ 	if (memcpy_fromiovecend((void *)iph, from, 0, length))
+@@ -630,7 +633,8 @@ out:
+ 	return len;
+ 
+ do_confirm:
+-	dst_confirm(&rt->dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(&rt->dst, &fl4.daddr);
+ 	if (!(msg->msg_flags & MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index ffc6c51..e24883d 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -158,6 +158,7 @@ static u32 *ipv4_cow_metrics(struct dst_entry *dst, unsigned long old)
+ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 					   struct sk_buff *skb,
+ 					   const void *daddr);
++static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr);
+ 
+ static struct dst_ops ipv4_dst_ops = {
+ 	.family =		AF_INET,
+@@ -174,6 +175,7 @@ static struct dst_ops ipv4_dst_ops = {
+ 	.redirect =		ip_do_redirect,
+ 	.local_out =		__ip_local_out,
+ 	.neigh_lookup =		ipv4_neigh_lookup,
++	.confirm_neigh =	ipv4_confirm_neigh,
+ };
+ 
+ #define ECN_OR_COST(class)	TC_PRIO_##class
+@@ -467,6 +469,23 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 	return neigh_create(&arp_tbl, pkey, dev);
+ }
+ 
++static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr)
++{
++	struct net_device *dev = dst->dev;
++	const __be32 *pkey = daddr;
++	const struct rtable *rt;
++
++	rt = (const struct rtable *)dst;
++	if (rt->rt_gateway)
++		pkey = (const __be32 *)&rt->rt_gateway;
++	else if (!daddr ||
++		 (rt->rt_flags &
++		  (RTCF_MULTICAST | RTCF_BROADCAST | RTCF_LOCAL)))
++		return;
++
++	__ipv4_confirm_neigh(dev, *(__force u32 *)pkey);
++}
++
+ #define IP_IDENTS_SZ 2048u
+ struct ip_ident_bucket {
+ 	atomic_t	id;
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 82210b9..c6b87da 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3560,11 +3560,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 	if (tp->tlp_high_seq)
+ 		tcp_process_tlp_ack(sk, ack, flag);
+ 
+-	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP)) {
+-		struct dst_entry *dst = __sk_dst_get(sk);
+-		if (dst)
+-			dst_confirm(dst);
+-	}
++	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
++		sk_dst_confirm(sk);
+ 
+ 	if (icsk->icsk_pending == ICSK_TIME_RETRANS)
+ 		tcp_schedule_loss_probe(sk);
+@@ -5804,7 +5801,6 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 		break;
+ 
+ 	case TCP_FIN_WAIT1: {
+-		struct dst_entry *dst;
+ 		int tmo;
+ 
+ 		/* If we enter the TCP_FIN_WAIT1 state and we are a
+@@ -5831,9 +5827,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 		tcp_set_state(sk, TCP_FIN_WAIT2);
+ 		sk->sk_shutdown |= SEND_SHUTDOWN;
+ 
+-		dst = __sk_dst_get(sk);
+-		if (dst)
+-			dst_confirm(dst);
++		sk_dst_confirm(sk);
+ 
+ 		if (!sock_flag(sk, SOCK_DEAD)) {
+ 			/* Wake up lingering close() */
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index 02307e2..4dff04c 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -371,12 +371,10 @@ void tcp_update_metrics(struct sock *sk)
+ 	u32 val;
+ 	int m;
+ 
++	sk_dst_confirm(sk);
+ 	if (sysctl_tcp_nometrics_save || !dst)
+ 		return;
+ 
+-	if (dst->flags & DST_HOST)
+-		dst_confirm(dst);
+-
+ 	rcu_read_lock();
+ 	if (icsk->icsk_backoff || !tp->srtt_us) {
+ 		/* This session failed to estimate rtt. Why?
+@@ -489,11 +487,10 @@ void tcp_init_metrics(struct sock *sk)
+ 	struct tcp_metrics_block *tm;
+ 	u32 val, crtt = 0; /* cached RTT scaled by 8 */
+ 
++	sk_dst_confirm(sk);
+ 	if (dst == NULL)
+ 		goto reset;
+ 
+-	dst_confirm(dst);
+-
+ 	rcu_read_lock();
+ 	tm = tcp_get_metrics(sk, dst, true);
+ 	if (!tm) {
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 9cb14de..bf24f30 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -950,6 +950,8 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 	skb_set_hash_from_sk(skb, sk);
+ 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
+ 
++	skb_set_dst_pending_confirm(skb, sk->sk_dst_pending_confirm);
++
+ 	/* Build TCP header and checksum it. */
+ 	th = tcp_hdr(skb);
+ 	th->source		= inet->inet_sport;
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 079ad60..09dd654 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1104,7 +1104,8 @@ out:
+ 	return err;
+ 
+ do_confirm:
+-	dst_confirm(&rt->dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(&rt->dst, &fl4->daddr);
+ 	if (!(msg->msg_flags&MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 2862cf4..9bdc955 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -110,6 +110,7 @@ static int ip6_finish_output2(struct sock *sk, struct sk_buff *skb)
+ 	if (unlikely(!neigh))
+ 		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
+ 	if (!IS_ERR(neigh)) {
++		sock_confirm_neigh(skb, neigh);
+ 		ret = dst_neigh_output(dst, neigh, skb);
+ 		rcu_read_unlock_bh();
+ 		return ret;
+@@ -1061,6 +1062,9 @@ static inline int ip6_ufo_append_data(struct sock *sk,
+ 
+ 		skb->csum = 0;
+ 
++		if (flags & MSG_CONFIRM)
++			skb_set_dst_pending_confirm(skb, 1);
++
+ 		__skb_queue_tail(queue, skb);
+ 	} else if (skb_is_gso(skb)) {
+ 		goto append;
+@@ -1429,6 +1433,9 @@ alloc_new_skb:
+ 			exthdrlen = 0;
+ 			dst_exthdrlen = 0;
+ 
++			if ((flags & MSG_CONFIRM) && !skb_prev)
++				skb_set_dst_pending_confirm(skb, 1);
++
+ 			/*
+ 			 * Put the packet on the pending queue
+ 			 */
+diff --git a/net/ipv6/raw.c b/net/ipv6/raw.c
+index 9b59b22..ddb2e73 100644
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@ -637,6 +637,9 @@ static int rawv6_send_hdrinc(struct sock *sk, void *from, int length,
+ 
+ 	skb->ip_summed = CHECKSUM_NONE;
+ 
++	if (flags & MSG_CONFIRM)
++		skb_set_dst_pending_confirm(skb, 1);
++
+ 	skb->transport_header = skb->network_header;
+ 	err = memcpy_fromiovecend((void *)iph, from, 0, length);
+ 	if (err)
+@@ -908,7 +911,8 @@ out:
+ 	txopt_put(opt_to_free);
+ 	return err<0?err:len;
+ do_confirm:
+-	dst_confirm(dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(dst, &fl6.daddr);
+ 	if (!(msg->msg_flags & MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 60d2fbe..19b545c 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -215,6 +215,21 @@ static struct neighbour *ip6_neigh_lookup(const struct dst_entry *dst,
+ 	return neigh_create(&nd_tbl, daddr, dst->dev);
+ }
+ 
++static void ip6_confirm_neigh(const struct dst_entry *dst, const void *daddr)
++{
++	struct net_device *dev = dst->dev;
++	struct rt6_info *rt = (struct rt6_info *)dst;
++
++	daddr = choose_neigh_daddr(rt, NULL, daddr);
++	if (!daddr)
++		return;
++	if (dev->flags & (IFF_NOARP | IFF_LOOPBACK))
++		return;
++	if (ipv6_addr_is_multicast((const struct in6_addr *)daddr))
++		return;
++	__ipv6_confirm_neigh(dev, daddr);
++}
++
+ static struct dst_ops ip6_dst_ops_template = {
+ 	.family			=	AF_INET6,
+ 	.protocol		=	cpu_to_be16(ETH_P_IPV6),
+@@ -232,6 +247,7 @@ static struct dst_ops ip6_dst_ops_template = {
+ 	.redirect		=	rt6_do_redirect,
+ 	.local_out		=	__ip6_local_out,
+ 	.neigh_lookup		=	ip6_neigh_lookup,
++	.confirm_neigh		=	ip6_confirm_neigh,
+ };
+ 
+ static unsigned int ip6_blackhole_mtu(const struct dst_entry *dst)
+@@ -1359,31 +1375,32 @@ static bool rt6_cache_allowed_for_pmtu(const struct rt6_info *rt)
+ static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
+ 				 const struct ipv6hdr *iph, u32 mtu)
+ {
++	const struct in6_addr *daddr, *saddr;
+ 	struct rt6_info *rt6 = (struct rt6_info *)dst;
+ 
+ 	if (rt6->rt6i_flags & RTF_LOCAL)
+ 		return;
+ 
+-	dst_confirm(dst);
++	if (iph) {
++		daddr = &iph->daddr;
++		saddr = &iph->saddr;
++	} else if (sk) {
++		daddr = &sk->sk_v6_daddr;
++		saddr = &inet6_sk(sk)->saddr;
++	} else {
++		daddr = NULL;
++		saddr = NULL;
++	}
++	dst_confirm_neigh(dst, daddr);
+ 	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
+ 	if (mtu >= dst_mtu(dst))
+ 		return;
+ 
+ 	if (!rt6_cache_allowed_for_pmtu(rt6)) {
+ 		rt6_do_update_pmtu(rt6, mtu);
+-	} else {
+-		const struct in6_addr *daddr, *saddr;
++	} else if (daddr) {
+ 		struct rt6_info *nrt6;
+ 
+-		if (iph) {
+-			daddr = &iph->daddr;
+-			saddr = &iph->saddr;
+-		} else if (sk) {
+-			daddr = &sk->sk_v6_daddr;
+-			saddr = &inet6_sk(sk)->saddr;
+-		} else {
+-			return;
+-		}
+ 		nrt6 = ip6_rt_cache_alloc(rt6, daddr, saddr);
+ 		if (nrt6) {
+ 			rt6_do_update_pmtu(nrt6, mtu);
+@@ -2176,7 +2193,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
+ 	 * Look, redirects are sent only in response to data packets,
+ 	 * so that this nexthop apparently is reachable. --ANK
+ 	 */
+-	dst_confirm(&rt->dst);
++	dst_confirm_neigh(&rt->dst, &ipv6_hdr(skb)->saddr);
+ 
+ 	neigh = __neigh_lookup(&nd_tbl, &msg->target, skb->dev, 1);
+ 	if (!neigh)
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index addc33a..fdee190 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -1395,7 +1395,8 @@ out:
+ 	return err;
+ 
+ do_confirm:
+-	dst_confirm(dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(dst, &fl6.daddr);
+ 	if (!(msg->msg_flags&MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/l2tp/l2tp_ip6.c b/net/l2tp/l2tp_ip6.c
+index aae2af6..e33512e 100644
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@ -644,7 +644,8 @@ out:
+ 	return err < 0 ? err : len;
+ 
+ do_confirm:
+-	dst_confirm(dst);
++	if (msg->msg_flags & MSG_PROBE)
++		dst_confirm_neigh(dst, &fl6.daddr);
+ 	if (!(msg->msg_flags & MSG_PROBE) || len)
+ 		goto back_from_confirm;
+ 	err = 0;
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index a5c3c9b..dc83027 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2796,6 +2796,23 @@ static struct neighbour *xfrm_neigh_lookup(const struct dst_entry *dst,
+ 	return dst->path->ops->neigh_lookup(dst, skb, daddr);
+ }
+ 
++static void xfrm_confirm_neigh(const struct dst_entry *dst, const void *daddr)
++{
++	const struct dst_entry *path = dst->path;
++
++	for (; dst != path; dst = dst->child) {
++		const struct xfrm_state *xfrm = dst->xfrm;
++
++		if (xfrm->props.mode == XFRM_MODE_TRANSPORT)
++			continue;
++		if (xfrm->type->flags & XFRM_TYPE_REMOTE_COADDR)
++			daddr = xfrm->coaddr;
++		else if (!(xfrm->type->flags & XFRM_TYPE_LOCAL_COADDR))
++			daddr = &xfrm->id.daddr;
++	}
++	path->ops->confirm_neigh(path, daddr);
++}
++
+ int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
+ {
+ 	int err = 0;
+@@ -2822,6 +2839,8 @@ int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
+ 			dst_ops->link_failure = xfrm_link_failure;
+ 		if (likely(dst_ops->neigh_lookup == NULL))
+ 			dst_ops->neigh_lookup = xfrm_neigh_lookup;
++		if (likely(!dst_ops->confirm_neigh))
++			dst_ops->confirm_neigh = xfrm_confirm_neigh;
+ 		if (likely(afinfo->garbage_collect == NULL))
+ 			afinfo->garbage_collect = xfrm_garbage_collect_deferred;
+ 		rcu_assign_pointer(xfrm_policy_afinfo[afinfo->family], afinfo);

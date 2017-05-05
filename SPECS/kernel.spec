@@ -5,7 +5,7 @@ Summary: The Linux kernel
 
 %define dist .el7
 
-# % define buildid .local
+%define buildid .neigh_confirm_backports
 
 # For a kernel released for public testing, released_kernel should be 1.
 # For internal testing builds during development, it should be 0.
@@ -84,8 +84,10 @@ Summary: The Linux kernel
 # turn off debug kernel and kabichk for gcov builds
 %if %{with_gcov}
 %define with_debug 0
-%define with_kabichk 0
 %endif
+
+# temporarily disable kabi check because neigh patches modify it
+%define with_kabichk 0
 
 %define make_target bzImage
 
@@ -1550,6 +1552,10 @@ fi
 %kernel_variant_files %{with_kdump} kdump
 
 %changelog
+* Fri May 05 2017 Ihar Hrachyshka <ihrachys@redhat.com> 3.10.0-514.16.1.el7.neigh_confirm_backports
+- [net] Fixed erroneous confirmations by upper layer protocols for unrelated neigh entries
+- Based on: https://www.spinics.net/lists/linux-rdma/msg45907.html
+
 * Wed Apr 12 2017 CentOS Sources <bugs@centos.org> - 3.10.0-514.16.1.el7
 - Apply debranding changes
 
